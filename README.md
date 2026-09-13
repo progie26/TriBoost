@@ -132,6 +132,58 @@ TriBoost **不联网**，不读取网页内容，不含统计、遥测、广告�
 
 隐藏状态会被记住，重启后依然隐藏。
 
+## 复验网站（`Scripts/verify-sites.py`）
+
+TriBoost 不控制倍速，它只是按住右方向键——倍速是网站自己的功能。所以内置名单里的每一条，本质上都是**对别人代码行为的断言**，而这种断言会在你不知情的时候失效：腾讯视频重写播放器之后，同一个按住的键就从倍速变成了快进。
+
+这个脚本把所有断言重新验一遍：
+
+```bash
+./Scripts/verify-sites.py                  # 全部网站，两种按键方式
+./Scripts/verify-sites.py --site 腾讯视频    # 只测一个
+./Scripts/verify-sites.py --use-login      # 复用登录态，绕开广告和付费墙
+./Scripts/verify-sites.py --keep-open      # 跑完保留浏览器，方便自己看
+```
+
+只依赖 Python 标准库（WebSocket 客户端是手写的），不需要装任何东西。它起一个**独立的临时 Chrome**，按键经 DevTools 协议注入，不需要窗口焦点，也完全不碰你正在用的浏览器。
+
+### 为什么要测两种按键方式
+
+```
+single  发一个 key-down，然后什么都不发，直到 key-up
+repeat  发 key-down，然后持续发送自动重复——真实键盘的行为
+```
+
+这两种方式**失败的方式不一样**。只看计时的播放器，`single` 就够；数重复次数的播放器（腾讯视频）在 `single` 下什么都收不到，还会把松手当成短按——在那个站上就是快进。
+
+**`single` 失败而 `repeat` 成功，就是这次那个 bug 的特征**，脚本会在汇总里直接点名：
+
+```
+腾讯视频      OK, but only with auto-repeat (single: SEEK) — this site counts key repeats
+```
+
+### 输出怎么读
+
+```
+B站
+  single  SPEED   1→3  jump 1.3s  keys 1     media 158s
+  repeat  SPEED   1→3  jump 1.3s  keys 70    media 158s
+```
+
+- `verdict`：`SPEED` 倍速生效 / `SEEK` 在快进（有害）/ `NONE` 毫无反应 / `BLOCKED` 撞了验证码 / `NO_MEDIA` 没找到能测的媒体
+- `keys`：页面**实际收到**的 keydown 次数。这一列是用来区分「网站忽略了按键」和「按键根本没送到」的——没有它，两者看起来一模一样
+- `media`：测到的媒体时长。数值很小说明测的是贴片广告，那一行的结论对正片无效
+
+脚本还会去读 `SiteMatcher.verifiedDomains`，如果有域名加进了 app 却没加进这里的待测列表，会直接报出来。
+
+### 已知的不稳定
+
+这些播放器在自动化环境下本身就不稳——同一个站连续跑三次可能给出三种结果，取决于广告播到哪一步。所以**失败会自动重试（默认 3 次），连续失败才算数**；成功则立即采纳（这套装置不可能凭空造出一个没发生的倍速）。
+
+没有哪一组参数能让四个站同时最顺：优酷带登录态容易撞滑块验证，爱奇艺不带登录态则要先看完贴片广告。脚本如实报告 `BLOCKED` / `NOT_PLAYING`，并根据你这次用没用 `--use-login` 给出下一步建议，而不是把它们算成失败。
+
+`--use-login` 会用 sqlite 在线备份复制一份 cookie（不需要退出你的 Chrome）。**这份副本含完整登录凭证**，放在临时目录里，跑完即删——除非你加了 `--keep-open`。
+
 ## 阈值调整
 
 所有可调数值集中在 `Sources/TriBoostCore/Thresholds.swift`：
