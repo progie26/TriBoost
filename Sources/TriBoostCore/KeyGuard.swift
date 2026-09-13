@@ -17,11 +17,13 @@ public final class KeyGuard {
     private let sender: any KeySending
     public private(set) var isDown = false
 
-    /// Some players watch for auto-repeat rather than a plain hold. Ours don't
-    /// (measured), so this is off by default and kept only as an escape hatch.
+    /// Some players decide a key is being *held* by counting auto-repeat events
+    /// rather than by timing a single press — Tencent Video is one, measured. A
+    /// real keyboard always repeats, so emitting repeats is the faithful thing to
+    /// do and is on by default; sites that only time the press ignore them.
     public var emitAutorepeat: Bool
 
-    public init(sender: any KeySending, emitAutorepeat: Bool = false) {
+    public init(sender: any KeySending, emitAutorepeat: Bool = true) {
         self.sender = sender
         self.emitAutorepeat = emitAutorepeat
     }

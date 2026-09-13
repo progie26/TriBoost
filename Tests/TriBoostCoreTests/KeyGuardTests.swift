@@ -49,13 +49,35 @@ final class KeyGuardTests: XCTestCase {
         XCTAssertEqual(sender.events, [])
     }
 
-    func testAutorepeatIsOffByDefault() {
+    /// Tencent Video decides a key is held by counting auto-repeats, so a lone
+    /// key-down never engages its speed-up and the release reads as a tap — which
+    /// on that site seeks. Measured: 6 s held with one key-down ran at 0.83x and
+    /// then jumped forward 7 s; the same hold with repeats ran at 2.66x.
+    func testAutorepeatIsOnByDefault() {
         let sender = RecordingSender()
         let guard_ = KeyGuard(sender: sender)
         guard_.press()
         guard_.repeatKey()
-        XCTAssertEqual(sender.events, [.down(autorepeat: false)],
-                       "measured: Bilibili/iQiyi/Tencent need no auto-repeat")
+        XCTAssertEqual(sender.events, [.down(autorepeat: false), .down(autorepeat: true)])
+    }
+
+    func testAutorepeatCanBeTurnedOff() {
+        let sender = RecordingSender()
+        let guard_ = KeyGuard(sender: sender, emitAutorepeat: false)
+        guard_.press()
+        guard_.repeatKey()
+        XCTAssertEqual(sender.events, [.down(autorepeat: false)])
+    }
+
+    func testRepeatsOnlyHappenWhileTheKeyIsDown() {
+        let sender = RecordingSender()
+        let guard_ = KeyGuard(sender: sender)
+        guard_.repeatKey()                     // never pressed
+        guard_.press()
+        guard_.release()
+        guard_.repeatKey()                     // already let go
+        XCTAssertEqual(sender.events, [.down(autorepeat: false), .up],
+                       "a stray repeat must never resurrect the key")
     }
 
     func testAutorepeatWhenExplicitlyEnabled() {
