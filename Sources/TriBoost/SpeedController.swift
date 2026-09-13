@@ -14,6 +14,11 @@ final class SpeedController: @unchecked Sendable {
     /// Invalidates a scheduled release if the key was pressed again in the meantime.
     private var pressGeneration = 0
 
+    /// Synthesises the auto-repeat a physically held key produces. `CGEvent` posts
+    /// one key-down and nothing more, which some players read as a tap rather than
+    /// a hold. Runs on `queue`, like everything else that touches the key.
+    private var repeatTimer: DispatchSourceTimer?
+
     /// Called on the main queue whenever the displayed state could have changed.
     var onStateChange: (@Sendable (GestureState) -> Void)?
 
@@ -77,6 +82,7 @@ final class SpeedController: @unchecked Sendable {
             pressGeneration &+= 1
             onBoostActive?(true)
             keyGuard.press()
+            startAutorepeat()
 
         case .release(let notBefore):
             // Disarm as soon as the gesture ends, not when the delayed key-up
@@ -84,12 +90,12 @@ final class SpeedController: @unchecked Sendable {
             // the trailing mouse-up is still matched.
             onBoostActive?(false)
             guard let notBefore else {
-                keyGuard.release()
+                releaseKey()
                 return
             }
             let delay = notBefore - now()
             guard delay > 0 else {
-                keyGuard.release()
+                releaseKey()
                 return
             }
             // Hold the key the rest of the minimum window so the site reads it as a
@@ -97,9 +103,31 @@ final class SpeedController: @unchecked Sendable {
             let generation = pressGeneration
             queue.asyncAfter(deadline: .now() + delay) { [weak self] in
                 guard let self, self.pressGeneration == generation else { return }
-                self.keyGuard.release()
+                self.releaseKey()
             }
         }
+    }
+
+    /// Stops the repeats and lets go. Every release path goes through here so a
+    /// timer can never outlive the key it is repeating.
+    private func releaseKey() {
+        stopAutorepeat()
+        keyGuard.release()
+    }
+
+    private func startAutorepeat() {
+        stopAutorepeat()
+        let t = DispatchSource.makeTimerSource(queue: queue)
+        t.schedule(deadline: .now() + machine.thresholds.autorepeatDelay,
+                   repeating: machine.thresholds.autorepeatInterval)
+        t.setEventHandler { [weak self] in self?.keyGuard.repeatKey() }
+        t.resume()
+        repeatTimer = t
+    }
+
+    private func stopAutorepeat() {
+        repeatTimer?.cancel()
+        repeatTimer = nil
     }
 }
 
