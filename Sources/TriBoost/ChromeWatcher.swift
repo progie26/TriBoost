@@ -16,19 +16,33 @@ import TriBoostCore
 final class ChromeWatcher: @unchecked Sendable {
     static let chromeBundleID = "com.google.Chrome"
 
-    private let matcher: SiteMatcher
+    private var matcher: SiteMatcher
     private let queue = DispatchQueue(label: "app.triboost.chrome")
     private var timer: DispatchSourceTimer?
     private var lastEligible: Bool?
+    private var lastFrontmost: Bool?
 
     /// Called whenever the answer to "is the front tab a site we support?" changes.
     /// Invoked off the main thread.
     var onEligibilityChange: (@Sendable (Bool) -> Void)?
     /// Called when Chrome stops being frontmost.
     var onChromeLostForeground: (@Sendable () -> Void)?
+    /// Called whenever Chrome moves in or out of the foreground. Reported apart
+    /// from eligibility so the menu can tell "not a supported site" from "Chrome
+    /// simply is not in front right now".
+    var onFrontmostChange: (@Sendable (Bool) -> Void)?
 
     init(matcher: SiteMatcher = SiteMatcher()) {
         self.matcher = matcher
+    }
+
+    /// Swap the domain list in after the user edits it, without a restart.
+    func updateMatcher(_ new: SiteMatcher) {
+        queue.async {
+            self.matcher = new
+            self.lastEligible = nil      // force a re-publish under the new rules
+            self.refresh()
+        }
     }
 
     func start() {
@@ -58,32 +72,61 @@ final class ChromeWatcher: @unchecked Sendable {
         let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
         if app?.bundleIdentifier != Self.chromeBundleID {
             lastEligible = false
+            lastFrontmost = false
+            onFrontmostChange?(false)
             onChromeLostForeground?()
         } else {
             queue.async { [weak self] in self?.refresh() }
         }
     }
 
+    // Written on `queue`, read from the main thread when the menu is built, so
+    // both fields go through one small lock rather than being racy.
+    private let stateLock = NSLock()
+    private var _currentURL: String?
+    private var _frontmost = false
+
     /// Latest known answer, for the menu.
-    private(set) var currentURL: String?
+    var currentURL: String? {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return _currentURL
+    }
+
+    /// Whether the last poll saw Chrome in front. A one-poll-stale answer is fine
+    /// for a label.
+    var isChromeFrontmost: Bool {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return _frontmost
+    }
 
     private func refresh() {
         let front = NSWorkspace.shared.frontmostApplication
         guard front?.bundleIdentifier == Self.chromeBundleID,
               let pid = front?.processIdentifier else {
-            publish(false, url: nil)
+            // Keep the last known URL: the menu wants to name the site even while
+            // Chrome sits behind it, which is the usual case while reading a menu.
+            publish(false, frontmost: false, url: currentURL)  // keep the last URL
             return
         }
         let url = Self.frontTabURL(pid: pid)
-        publish(matcher.allows(urlString: url), url: url)
+        publish(matcher.allows(urlString: url), frontmost: true, url: url)
     }
 
-    private func publish(_ eligible: Bool, url: String?) {
-        currentURL = url
+    private func publish(_ eligible: Bool, frontmost: Bool, url: String?) {
+        stateLock.lock()
+        _currentURL = url
+        _frontmost = frontmost
+        stateLock.unlock()
+
+        if frontmost != lastFrontmost {
+            lastFrontmost = frontmost
+            onFrontmostChange?(frontmost)
+        }
         guard eligible != lastEligible else { return }
         lastEligible = eligible
         onEligibilityChange?(eligible)
     }
+
 
     // MARK: - Accessibility reading
 

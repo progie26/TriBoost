@@ -6,12 +6,14 @@ import TriBoostCore
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private let controller = SpeedController(keySender: CGKeyEmitter())
-    private let chrome = ChromeWatcher()
+    private let domainStore = CustomDomainStore()
+    private lazy var chrome = ChromeWatcher(matcher: domainStore.matcher)
     private let touches = TouchMonitor()
     private let suppressor = DragClickSuppressor()
 
     private var isEnabled = true
     private var siteEligible = false
+    private var chromeFrontmost = false
     private var gestureState: GestureState = .idle
     private var signalSources: [DispatchSourceSignal] = []
     private var permissionTimer: Timer?
@@ -22,8 +24,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let enableMenuItem = NSMenuItem(title: "启用", action: #selector(toggleEnabled), keyEquivalent: "")
     private let loginMenuItem = NSMenuItem(title: "登录时启动", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
     private let hideIconMenuItem = NSMenuItem(title: "隐藏菜单栏图标", action: #selector(hideIcon), keyEquivalent: "")
+    private let siteMenuItem = NSMenuItem(title: "", action: #selector(toggleCurrentSite), keyEquivalent: "")
+    private let customListMenuItem = NSMenuItem(title: "已添加的网站", action: nil, keyEquivalent: "")
 
     private static let hideIconKey = "hideMenuBarIcon"
+    private static let addWarningShownKey = "customDomainWarningShown"
 
     // MARK: - Lifecycle
 
@@ -46,10 +51,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller.onBoostActive = { active in
             suppressor.isArmed = active
         }
+        // Captured like `controller` above, so the background callback never
+        // reaches back into the delegate off the main actor.
+        let watcher = chrome
         chrome.onEligibilityChange = { [weak self] eligible in
+            // Logged so "the gesture did nothing on site X" can be answered from
+            // Console.app: it shows exactly what URL was read and what was decided.
+            NSLog("TriBoost: eligible=\(eligible) url=\(watcher.currentURL ?? "nil")")
             controller.setEligible(eligible)
             Task { @MainActor in
                 self?.siteEligible = eligible
+                self?.refreshMenu()
+            }
+        }
+        chrome.onFrontmostChange = { [weak self] frontmost in
+            Task { @MainActor in
+                self?.chromeFrontmost = frontmost
                 self?.refreshMenu()
             }
         }
@@ -176,8 +193,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.image = AppIcon.menuBarImage()
 
         let menu = NSMenu()
+        // We decide what is greyed out ourselves; AppKit's automatic validation
+        // would override the site item's enabled state on every menu open.
+        menu.autoenablesItems = false
         statusMenuItem.isEnabled = false
         menu.addItem(statusMenuItem)
+        menu.addItem(.separator())
+
+        siteMenuItem.target = self
+        menu.addItem(siteMenuItem)
+        customListMenuItem.submenu = NSMenu()
+        menu.addItem(customListMenuItem)
         menu.addItem(.separator())
 
         enableMenuItem.target = self
@@ -203,13 +229,96 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let status = AppStatus.derive(
             enabled: isEnabled,
             hasAccessibility: hasAccessibility,
+            chromeFrontmost: chromeFrontmost,
             siteEligible: siteEligible,
             state: gestureState
         )
         statusMenuItem.title = "状态：\(status.localizedDescription)"
+        refreshSiteMenuItems()
         enableMenuItem.title = isEnabled ? "停用" : "启用"
         loginMenuItem.state = LaunchAtLogin.isEnabled ? .on : .off
         statusItem.button?.appearsDisabled = !isEnabled || !hasAccessibility
+    }
+
+    /// The built-in list only grows when someone re-measures every site and ships a
+    /// build. These two items let the user enable a site the moment they find one
+    /// that works, and take it back out when a site changes its mind — which is
+    /// exactly what Tencent Video did.
+    private func refreshSiteMenuItems() {
+        let builtIn = SiteMatcher()
+        let url = chrome.currentURL
+        let domain = SiteMatcher.domain(toAdd: url)
+
+        if let domain {
+            if builtIn.allows(urlString: url) {
+                siteMenuItem.title = "\(domain)：内置支持"
+                siteMenuItem.isEnabled = false
+            } else if domainStore.contains(domain) {
+                siteMenuItem.title = "移出名单：\(domain)"
+                siteMenuItem.isEnabled = true
+            } else {
+                siteMenuItem.title = "加入名单：\(domain)"
+                siteMenuItem.isEnabled = true
+            }
+        } else {
+            siteMenuItem.title = "读不到当前网址"
+            siteMenuItem.isEnabled = false
+        }
+
+        let custom = domainStore.domains
+        customListMenuItem.isHidden = custom.isEmpty
+        let submenu = customListMenuItem.submenu ?? NSMenu()
+        submenu.removeAllItems()
+        for d in custom {
+            let item = NSMenuItem(title: "移除 \(d)", action: #selector(removeCustomDomain(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = d
+            submenu.addItem(item)
+        }
+        customListMenuItem.submenu = submenu
+    }
+
+    @objc private func toggleCurrentSite() {
+        guard let domain = SiteMatcher.domain(toAdd: chrome.currentURL) else { return }
+        if domainStore.contains(domain) {
+            domainStore.remove(domain)
+        } else {
+            guard confirmAddingIfNeeded(domain) else { return }
+            domainStore.add(domain)
+        }
+        chrome.updateMatcher(domainStore.matcher)
+        refreshMenu()
+    }
+
+    @objc private func removeCustomDomain(_ sender: NSMenuItem) {
+        guard let domain = sender.representedObject as? String else { return }
+        domainStore.remove(domain)
+        chrome.updateMatcher(domainStore.matcher)
+        refreshMenu()
+    }
+
+    /// Shown once. Adding the wrong site is not harmless: on a site that does not
+    /// implement hold-to-speed, holding the right arrow seeks the video forward
+    /// again and again, which is worse than the gesture doing nothing.
+    private func confirmAddingIfNeeded(_ domain: String) -> Bool {
+        guard !UserDefaults.standard.bool(forKey: Self.addWarningShownKey) else { return true }
+
+        let alert = NSAlert()
+        alert.messageText = "把 \(domain) 加入名单？"
+        alert.informativeText = """
+        TriBoost 本身不控制倍速，它只是按住右方向键——倍速是网站自己的功能。
+
+        如果这个网站没有「长按右方向键 = 倍速」，那么三指静止会变成反复快进，视频会一直往前跳。
+
+        请先手动按住右方向键确认一下：视频是变快，还是在跳进度。确认无误再加入。
+        """
+        alert.addButton(withTitle: "我已确认，加入")
+        alert.addButton(withTitle: "取消")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return false }
+
+        UserDefaults.standard.set(true, forKey: Self.addWarningShownKey)
+        return true
     }
 
     @objc private func toggleEnabled() {

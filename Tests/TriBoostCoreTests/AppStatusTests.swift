@@ -21,6 +21,22 @@ final class AppStatusTests: XCTestCase {
         XCTAssertEqual(status, .unsupportedSite)
     }
 
+    /// Reading the menu can itself pull the focus off Chrome. Reporting that as
+    /// "当前网站不支持" made a supported site look broken, so the two are separate.
+    func testChromeNotFrontmostIsNotReportedAsAnUnsupportedSite() {
+        let status = AppStatus.derive(enabled: true, hasAccessibility: true,
+                                      chromeFrontmost: false, siteEligible: false,
+                                      state: .idle)
+        XCTAssertEqual(status, .chromeNotFrontmost)
+    }
+
+    func testPermissionStillOutranksChromeBeingBehind() {
+        let status = AppStatus.derive(enabled: true, hasAccessibility: false,
+                                      chromeFrontmost: false, siteEligible: false,
+                                      state: .idle)
+        XCTAssertEqual(status, .missingAccessibility)
+    }
+
     func testEachGestureStateMapsToItsLabel() {
         func status(_ state: GestureState) -> AppStatus {
             AppStatus.derive(enabled: true, hasAccessibility: true,
@@ -32,14 +48,15 @@ final class AppStatusTests: XCTestCase {
         XCTAssertEqual(status(.cancelledForDrag), .recognisedAsDrag)
     }
 
-    /// The six labels the menu is specified to show.
+    /// The labels the menu is specified to show.
     func testAllRequiredLabelsExist() {
         let labels: [AppStatus] = [
-            .disabled, .waitingForFingers, .speeding,
-            .recognisedAsDrag, .unsupportedSite, .missingAccessibility,
+            .disabled, .waitingForFingers, .speeding, .recognisedAsDrag,
+            .unsupportedSite, .missingAccessibility, .chromeNotFrontmost,
         ]
-        XCTAssertEqual(Set(labels.map(\.localizedDescription)).count, 6,
+        XCTAssertEqual(Set(labels.map(\.localizedDescription)).count, 7,
                        "each status needs a distinct label")
+        XCTAssertEqual(AppStatus.chromeNotFrontmost.localizedDescription, "Chrome 不在前台")
         XCTAssertEqual(AppStatus.disabled.localizedDescription, "未启用")
         XCTAssertEqual(AppStatus.waitingForFingers.localizedDescription, "等待三指")
         XCTAssertEqual(AppStatus.speeding.localizedDescription, "倍速中")
